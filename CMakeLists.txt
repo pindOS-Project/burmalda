@@ -15,7 +15,12 @@ target_include_directories(burmalda PUBLIC
 )
 
 target_link_libraries(burmalda
-    PUBLIC sel4
+    PUBLIC
+        sel4
+        sel4_autoconf
+        sel4_Config
+        kernel_Config
+        muslc
 )
 
 # -------------------------------------------------------------------------
