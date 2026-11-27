@@ -27,6 +27,15 @@
  * Source: arch/x86/entry/syscalls/syscall_64.tbl in the Linux kernel.
  * ----------------------------------------------------------------------- */
 /* Linux errno values (negated on return: return -ENOSYS etc.) */
+#define BURMALDA_EBUSY  -16
+#define BURMALDA_EXDEV  -18
+#define BURMALDA_EISDIR  -21
+#define BURMALDA_ENFILE  -23
+#define BURMALDA_EMFILE  -24
+#define BURMALDA_EPIPE  -32
+#define BURMALDA_ERANGE  -34
+#define BURMALDA_ENOTEMPTY  -39
+#define BURMALDA_ELOOP  -40
 #define BURMALDA_ENOSYS   38
 #define BURMALDA_EBADF     9
 #define BURMALDA_EINVAL   22
@@ -196,6 +205,11 @@ static inline seL4_MessageInfo_t burmalda_make_reply(long retval)
 #define BURMALDA_SYS_nanosleep   35
 #define BURMALDA_SYS_clock_nanosleep 230
 #define BURMALDA_SYS_waitid       247
+#define BURMALDA_SYS_rename       82
+#define BURMALDA_SYS_mkdir        83
+#define BURMALDA_SYS_rmdir        84
+#define BURMALDA_SYS_mkdirat      258
+#define BURMALDA_SYS_renameat2    316
 
 /* -----------------------------------------------------------------------
  * Process-manager hooks.

@@ -341,6 +341,11 @@ struct bproc {
     seL4_Word brk;
     struct bfile fds[BURMALDA_MAX_FDS];
 
+    /* tracked process state (survives fds, reset on exec) */
+    char     cwd[128];          /* absolute current working directory */
+    char     exe[96];           /* path of the current executable */
+    uint32_t termios[4];        /* iflag/oflag/cflag/lflag (TCSETS) */
+
     struct sigent sigs[65];
     seL4_Word blocked_mask;
     seL4_Word pending_mask;
@@ -386,6 +391,9 @@ static void bproc_reset(seL4_Word badge)
         bp->blocked_mask = 0;
         bp->pending_mask = 0;
         bp->in_signal = false;
+        strcpy(bp->cwd, "/");
+        bp->exe[0] = '\0';
+        memset(bp->termios, 0, sizeof(bp->termios));
     }
 }
 
@@ -487,6 +495,7 @@ struct rfile {
     char        name[96];
     bool        is_dir;
     bool        ro;
+    uint32_t    mode;           /* chmod/fchmod target; 0 = default */
     uint8_t    *data;
     seL4_Word   len;
     seL4_Word   cap;
@@ -749,11 +758,59 @@ static long fd_write_buffered(seL4_Word badge, struct bproc *bp, long fd,
  * Deferred completion (called from the main loop).
  * --------------------------------------------------------------------- */
 
+/* One-character pushback for poll/read readiness on the console. */
+static int _console_stash = -1;         /* -1 = empty, else byte value */
+
+static bool console_char_avail(void)
+{
+    char c;
+    if (_console_stash >= 0) return true;
+    if (!seL4_DebugTryGetChar(&c)) return false;
+    _console_stash = (int)(uint8_t)c;
+    return true;
+}
+
+static bool _pending_poll_valid;
+static seL4_Word _pending_poll_badge;
+static seL4_Word _pending_poll_fds_p;
+static seL4_Word _pending_poll_nfds;
+static seL4_Word _pending_poll_mrs[18];
+
+static bool burmalda_complete_deferred_poll(void)
+{
+    if (!_pending_poll_valid) return false;
+    if (!console_char_avail()) return false;
+
+    int ready = 0;
+    uint8_t raw[64 * 8];
+    seL4_Word total = _pending_poll_nfds * 8;
+    if (burmalda_read_child(_pending_poll_badge, raw, _pending_poll_fds_p,
+                            total)) {
+        for (seL4_Word i = 0; i < _pending_poll_nfds; i++) {
+            int32_t fd;
+            memcpy(&fd, raw + i * 8, 4);
+            if (fd == 0) {
+                uint16_t rev = 1;
+                memcpy(raw + i * 8 + 6, &rev, 2);
+                ready++;
+            }
+        }
+        burmalda_write_child(_pending_poll_badge, _pending_poll_fds_p, raw,
+                             total);
+    }
+    seL4_Word ctx20[20];
+    ctx_from_mrs(_pending_poll_mrs, (seL4_Word)ready, ctx20);
+    _pending_poll_valid = false;
+    burmalda_write_child_ctx(_pending_poll_badge, ctx20, true);
+    return true;
+}
+
 static bool burmalda_complete_deferred_read(void)
 {
     if (!_pending_read_valid) return false;
-    char c;
-    if (!seL4_DebugTryGetChar(&c)) return false;
+    if (!console_char_avail()) return false;
+    char c = (char)_console_stash;
+    _console_stash = -1;
 
     long rax;
     if (burmalda_write_child(_pending_read_badge, _pending_read_buf, &c, 1)) {
@@ -818,6 +875,29 @@ static bool read_child_str(seL4_Word badge, seL4_Word addr,
     return false;
 }
 
+/* Resolve `path` against the process cwd into an absolute ramfs path. */
+static bool proc_abs_path(struct bproc *bp, const char *path,
+                          char *out, seL4_Word out_len)
+{
+    if (path == NULL || path[0] == '\0') return false;
+    if (path[0] == '/') {
+        if (strlen(path) >= out_len) return false;
+        memcpy(out, path, strlen(path) + 1);
+        return true;
+    }
+    if (bp == NULL) {
+        if (out_len < 2) return false;
+        memcpy(out, "/", 2);
+        return false;
+    }
+    seL4_Word cn = strlen(bp->cwd);
+    if (cn + 1 + strlen(path) >= out_len) return false;
+    memcpy(out, bp->cwd, cn);
+    if (cn > 0 && out[cn - 1] != '/') out[cn++] = '/';
+    memcpy(out + cn, path, strlen(path) + 1);
+    return true;
+}
+
 static int alloc_fd(struct bproc *bp)
 {
     for (int fd = 3; fd < BURMALDA_MAX_FDS; fd++) {
@@ -831,6 +911,9 @@ static void fill_stat(const struct rfile *f, uint8_t out[144])
     memset(out, 0, 144);
     uint64_t dev = 0x1000, ino = 1, nlink = 1;
     uint32_t mode = f->is_dir ? 0040755u : 0100644u;
+    if (f->mode != 0) {
+        mode = (mode & 0xF000u) | (f->mode & 0x0FFFu);
+    }
     uint64_t size = rfile_len(f);
     memcpy(out + 0,  &dev, 8);
     memcpy(out + 8,  &ino, 8);
@@ -968,9 +1051,14 @@ static long burmalda_handle_openat(seL4_Word badge, bool at)
         return -BURMALDA_EFAULT;
     }
 
+    struct bproc *bpc = bproc_get(badge, false);
+    char cwdfull[192];
     struct rfile *f = NULL;
     if (path[0] == '/') {
         f = ramfs_find(path);
+    } else if (at && burmalda_get_arg0() == (seL4_Word)-100 &&
+               proc_abs_path(bpc, path, cwdfull, sizeof(cwdfull))) {
+        f = ramfs_find(cwdfull);
     } else if (at) {
         long dirfd = burmalda_get_arg0();
         struct bproc *bpd = bproc_get(badge, false);
@@ -994,6 +1082,9 @@ static long burmalda_handle_openat(seL4_Word badge, bool at)
         if (path[0] == '/') {
             if (strlen(path) >= sizeof(full)) return -BURMALDA_ENAMETOOLONG;
             memcpy(full, path, strlen(path) + 1);
+        } else if (at && burmalda_get_arg0() == (seL4_Word)-100 &&
+                   proc_abs_path(bpc, path, full, sizeof(full))) {
+            /* resolved above */
         } else if (at) {
             long dirfd = burmalda_get_arg0();
             struct bproc *bpd = bproc_get(badge, false);
@@ -1062,7 +1153,9 @@ static long burmalda_handle_read(seL4_Word badge)
     if (fd == 0) {
         if (count <= 0) return -BURMALDA_EINVAL;
         char c;
-        if (seL4_DebugTryGetChar(&c)) {
+        if (console_char_avail()) {
+            c = (char)_console_stash;
+            _console_stash = -1;
             if (!burmalda_write_child(badge, buf, &c, 1)) {
                 return -BURMALDA_EFAULT;
             }
@@ -1165,9 +1258,16 @@ static long burmalda_handle_newfstatat(seL4_Word badge, bool at)
         if (bp == NULL || fd < 3 || !bp->fds[fd].open) return -BURMALDA_EBADF;
         f = bp->fds[fd].f;
     } else {
-        char path[128];
+        char path[128], full[192];
         if (!read_child_str(badge, pathp, path, sizeof(path))) {
             return -BURMALDA_EFAULT;
+        }
+        if (path[0] != '/') {
+            char cwdfull[192];
+            if (proc_abs_path(bproc_get(badge, false), path, cwdfull,
+                              sizeof(cwdfull))) {
+                memcpy(path, cwdfull, strlen(cwdfull) + 1);
+            }
         }
         f = ramfs_find(path);
     }
@@ -1197,6 +1297,9 @@ static long burmalda_handle_statx(seL4_Word badge)
     memset(sx, 0, sizeof(sx));
     uint32_t mask = 0x000007ff;
     uint32_t mode = f->is_dir ? 0040755u : 0100644u;
+    if (f->mode != 0) {
+        mode = (mode & 0xF000u) | (f->mode & 0x0FFFu);
+    }
     uint64_t size = rfile_len(f);
     uint32_t nlink = 1;
     memcpy(sx + 0, &mask, 4);
@@ -1411,9 +1514,123 @@ static long burmalda_handle_unlink(seL4_Word badge)
     if (!read_child_str(badge, pathp, path, sizeof(path))) {
         return -BURMALDA_EFAULT;
     }
-    struct rfile *f = ramfs_find(path);
+    struct bproc *bp = bproc_get(badge, false);
+    char full[192];
+    if (!proc_abs_path(bp, path, full, sizeof(full))) {
+        return -BURMALDA_ENAMETOOLONG;
+    }
+    struct rfile *f = ramfs_find(full);
     if (f == NULL) return -BURMALDA_ENOENT;
     if (f->ro || f->is_dir) return -BURMALDA_EPERM;
+    f->name[0] = '\0';
+    return 0;
+}
+
+static long burmalda_handle_chmod(seL4_Word badge, bool by_fd)
+{
+    struct bproc *bp = bproc_get(badge, false);
+    struct rfile *f;
+    if (by_fd) {
+        long fd = burmalda_get_arg0();
+        if (bp == NULL || fd < 3 || fd >= BURMALDA_MAX_FDS ||
+            !bp->fds[fd].open || bp->fds[fd].f == NULL) {
+            return -BURMALDA_EBADF;
+        }
+        f = bp->fds[fd].f;
+    } else {
+        seL4_Word pathp = (seL4_Word)burmalda_get_arg0();
+        char path[128], full[192];
+        if (!read_child_str(badge, pathp, path, sizeof(path))) {
+            return -BURMALDA_EFAULT;
+        }
+        if (!proc_abs_path(bp, path, full, sizeof(full))) {
+            return -BURMALDA_ENAMETOOLONG;
+        }
+        f = ramfs_find(full);
+        if (f == NULL) return -BURMALDA_ENOENT;
+    }
+    uint32_t m = (uint32_t)burmalda_get_arg1();
+    f->mode = m & 0x0FFFu;
+    return 0;
+}
+
+static long burmalda_handle_renameat(seL4_Word badge, bool at)
+{
+    /* rename(oldpath, newpath) / renameat(olddfd, old, newdfd, new, flags) */
+    seL4_Word oldp, newp;
+    if (at) {
+        oldp = (seL4_Word)burmalda_get_arg1();
+        newp = (seL4_Word)burmalda_get_arg3();
+    } else {
+        oldp = (seL4_Word)burmalda_get_arg0();
+        newp = (seL4_Word)burmalda_get_arg1();
+    }
+    char oldp_str[128], newp_str[128], oldfull[192], newfull[192];
+    if (!read_child_str(badge, oldp, oldp_str, sizeof(oldp_str)) ||
+        !read_child_str(badge, newp, newp_str, sizeof(newp_str))) {
+        return -BURMALDA_EFAULT;
+    }
+    struct bproc *bp = bproc_get(badge, false);
+    if (!proc_abs_path(bp, oldp_str, oldfull, sizeof(oldfull)) ||
+        !proc_abs_path(bp, newp_str, newfull, sizeof(newfull))) {
+        return -BURMALDA_ENAMETOOLONG;
+    }
+    struct rfile *f = ramfs_find(oldfull);
+    if (f == NULL) return -BURMALDA_ENOENT;
+    if (f->ro) return -BURMALDA_EPERM;
+    struct rfile *t = ramfs_find(newfull);
+    if (t == f) return 0;
+    if (t != NULL && t->ro) return -BURMALDA_EPERM;
+    if (strlen(newfull) >= sizeof(f->name)) return -BURMALDA_ENAMETOOLONG;
+    if (t != NULL) t->name[0] = '\0';          /* tombstone the target */
+    strcpy(f->name, newfull);
+    return 0;
+}
+
+static long burmalda_handle_mkdir(seL4_Word badge, bool at)
+{
+    seL4_Word pathp = at ? (seL4_Word)burmalda_get_arg1()
+                         : (seL4_Word)burmalda_get_arg0();
+    char path[128], full[192];
+    if (!read_child_str(badge, pathp, path, sizeof(path))) {
+        return -BURMALDA_EFAULT;
+    }
+    struct bproc *bp = bproc_get(badge, false);
+    if (!proc_abs_path(bp, path, full, sizeof(full))) {
+        return -BURMALDA_ENAMETOOLONG;
+    }
+    if (ramfs_find(full) != NULL) return -BURMALDA_EEXIST;
+    if (ramfs_alloc_entry(full, true, false) == NULL) {
+        return -BURMALDA_ENOSPC;
+    }
+    return 0;
+}
+
+static long burmalda_handle_rmdir(seL4_Word badge)
+{
+    seL4_Word pathp = (seL4_Word)burmalda_get_arg0();
+    char path[128], full[192];
+    if (!read_child_str(badge, pathp, path, sizeof(path))) {
+        return -BURMALDA_EFAULT;
+    }
+    struct bproc *bp = bproc_get(badge, false);
+    if (!proc_abs_path(bp, path, full, sizeof(full))) {
+        return -BURMALDA_ENAMETOOLONG;
+    }
+    if (strcmp(full, "/") == 0) return -BURMALDA_EBUSY;
+    struct rfile *f = ramfs_find(full);
+    if (f == NULL) return -BURMALDA_ENOENT;
+    if (!f->is_dir) return -BURMALDA_ENOTDIR;
+    if (f->ro) return -BURMALDA_EPERM;
+    /* only empty directories */
+    seL4_Word n = strlen(full);
+    for (int i = 0; i < _entry_count; i++) {
+        if (_entries[i].name[0] == '\0') continue;
+        if (strncmp(_entries[i].name, full, n) == 0 &&
+            _entries[i].name[n] == '/') {
+            return -BURMALDA_ENOTEMPTY;
+        }
+    }
     f->name[0] = '\0';
     return 0;
 }
@@ -1440,7 +1657,12 @@ static long burmalda_handle_execve(seL4_Word badge)
         return -BURMALDA_EFAULT;
     }
 
-    const struct rfile *f = ramfs_find(path);
+    struct bproc *bp0 = bproc_get(badge, true);
+    char exe_path[96];
+    if (!proc_abs_path(bp0, path, exe_path, sizeof(exe_path))) {
+        return -BURMALDA_ENAMETOOLONG;
+    }
+    const struct rfile *f = ramfs_find(exe_path);
     if (f == NULL || f->is_dir || f->data == NULL) return -BURMALDA_ENOENT;
 
     static char argv_bufs[8][64];
@@ -1470,6 +1692,10 @@ static long burmalda_handle_execve(seL4_Word badge)
     if (rc != 0) return -BURMALDA_ENOEXEC;
 
     bproc_reset(badge);
+    struct bproc *bp = bproc_get(badge, false);
+    if (bp != NULL) {
+        strcpy(bp->exe, exe_path);
+    }
     return BURMALDA_NO_REPLY;
 }
 
@@ -1485,6 +1711,7 @@ static long burmalda_handle_wait4(seL4_Word badge)
         dead = _dead_child(_dead_child_ctx, badge, &status);
         if (dead != 0 && (pid == -1 || pid == (long)dead) && _reap != NULL) {
             _reap(_reap_ctx, dead);
+            bproc_reset(dead);   /* badge may be reused by the next spawn */
         }
     }
     if (dead != 0 && (pid == -1 || pid == (long)dead)) {
@@ -1570,6 +1797,13 @@ static long burmalda_handle_exit(seL4_Word badge)
         _pending_wait_valid = false;
     }
 
+    /* The parent reaped this child via the deferred wait4 above (or the
+     * child is an orphan with nobody to reap it): release the proc slot
+     * so the badge becomes reusable. */
+    if (_reap != NULL && parent != 0) {
+        _reap(_reap_ctx, badge);
+    }
+    bproc_reset(badge);
     struct bproc *bp = bproc_get(badge, false);
     if (bp != NULL) bp->used = false;
     return BURMALDA_NO_REPLY;
@@ -1617,9 +1851,47 @@ static long burmalda_handle_getcwd(seL4_Word badge)
 {
     seL4_Word buf = (seL4_Word)burmalda_get_arg0();
     long size = burmalda_get_arg1();
-    if ((long)size < 2) return -BURMALDA_EINVAL;
-    if (!burmalda_write_child(badge, buf, "/\0", 2)) return -BURMALDA_EFAULT;
-    return 2;
+    struct bproc *bp = bproc_get(badge, false);
+    const char *cwd = (bp != NULL && bp->cwd[0] != '\0') ? bp->cwd : "/";
+    seL4_Word n = strlen(cwd) + 1;
+    if ((long)size < (long)n) return -BURMALDA_ERANGE;
+    if (!burmalda_write_child(badge, buf, cwd, n)) return -BURMALDA_EFAULT;
+    return (long)n;
+}
+
+static long burmalda_handle_chdir(seL4_Word badge)
+{
+    seL4_Word pathp = (seL4_Word)burmalda_get_arg0();
+    char path[128], full[192];
+    if (!read_child_str(badge, pathp, path, sizeof(path))) {
+        return -BURMALDA_EFAULT;
+    }
+    struct bproc *bp = bproc_get(badge, true);
+    if (bp == NULL) return -BURMALDA_ENOMEM;
+    if (!proc_abs_path(bp, path, full, sizeof(full))) {
+        return -BURMALDA_ENAMETOOLONG;
+    }
+    struct rfile *f = ramfs_find(full);
+    if (f == NULL) return -BURMALDA_ENOENT;
+    if (!f->is_dir) return -BURMALDA_ENOTDIR;
+    if (strlen(full) >= sizeof(bp->cwd)) return -BURMALDA_ENAMETOOLONG;
+    strcpy(bp->cwd, full);
+    return 0;
+}
+
+static long burmalda_handle_fchdir(seL4_Word badge)
+{
+    long fd = burmalda_get_arg0();
+    struct bproc *bp = bproc_get(badge, true);
+    if (bp == NULL) return -BURMALDA_ENOMEM;
+    if (fd < 3 || fd >= BURMALDA_MAX_FDS || !bp->fds[fd].open ||
+        bp->fds[fd].f == NULL || !bp->fds[fd].is_dir) {
+        return -BURMALDA_ENOTDIR;
+    }
+    const char *dir = bp->fds[fd].f->name;
+    if (strlen(dir) >= sizeof(bp->cwd)) return -BURMALDA_ENAMETOOLONG;
+    strcpy(bp->cwd, dir);
+    return 0;
 }
 
 static long burmalda_handle_getrlimit(seL4_Word badge)
@@ -1659,6 +1931,7 @@ static long burmalda_handle_ioctl(seL4_Word badge)
         memset(t, 0, sizeof(t));
         uint32_t iflag = 0x00000500, oflag = 0x00000003;
         uint32_t cflag = 0x000000b0, lflag = 0x0000008a;
+
         memcpy(t + 0, &iflag, 4);
         memcpy(t + 4, &oflag, 4);
         memcpy(t + 8, &cflag, 4);
@@ -1695,6 +1968,9 @@ static long burmalda_handle_fork(seL4_Word badge)
     if (cbp != NULL && pbp != NULL) {
         cbp->ppid = badge;
         cbp->brk = pbp->brk;
+        memcpy(cbp->cwd, pbp->cwd, sizeof(cbp->cwd));
+        memcpy(cbp->exe, pbp->exe, sizeof(cbp->exe));
+        memcpy(cbp->termios, pbp->termios, sizeof(cbp->termios));
     }
 
     seL4_Word ctx20[20];
@@ -1786,12 +2062,24 @@ static long burmalda_handle_poll(seL4_Word badge)
         return -BURMALDA_EFAULT;
     }
     int ready = 0;
+    bool want_console = false;
     for (long i = 0; i < nfds; i++) {
         int32_t fd;
         uint16_t ev;
         memcpy(&fd, raw + i * 8, 4);
         memcpy(&ev, raw + i * 8 + 4, 2);
         uint16_t rev = 0;
+        if (fd == 0 && (ev & 1)) {
+            /* console stdin: readiness = a received byte is available */
+            if (console_char_avail()) {
+                rev |= 1;
+                ready++;
+            } else {
+                want_console = true;
+            }
+            memcpy(raw + i * 8 + 6, &rev, 2);
+            continue;
+        }
         if (fd >= 0 && fd < BURMALDA_MAX_FDS && bp->fds[fd].open) {
             if (bp->fds[fd].kind == FD_PIPE_RD && (ev & 1)) {
                 if (bp->fds[fd].pipe->len > 0 || bp->fds[fd].pipe->wr_closed) {
@@ -1803,6 +2091,18 @@ static long burmalda_handle_poll(seL4_Word badge)
         }
         if (rev) ready++;
         memcpy(raw + i * 8 + 6, &rev, 2);
+    }
+    if (want_console && ready == 0) {
+        /* block the poll until a console byte arrives */
+        if (!_pending_poll_valid) {
+            _pending_poll_valid = true;
+            _pending_poll_badge = badge;
+            _pending_poll_fds_p = fds_p;
+            _pending_poll_nfds = (seL4_Word)nfds;
+            save_fault_mrs(_pending_poll_mrs);
+            return BURMALDA_NO_REPLY;
+        }
+        return 0;
     }
     if (!burmalda_write_child(badge, fds_p, raw, (seL4_Word)nfds * 8)) {
         return -BURMALDA_EFAULT;
@@ -1818,7 +2118,12 @@ static long burmalda_handle_stat(seL4_Word badge)
     if (!read_child_str(badge, pathp, path, sizeof(path))) {
         return -BURMALDA_EFAULT;
     }
-    struct rfile *f = ramfs_find(path);
+    struct bproc *bp = bproc_get(badge, false);
+    char full[192];
+    if (!proc_abs_path(bp, path, full, sizeof(full))) {
+        return -BURMALDA_ENAMETOOLONG;
+    }
+    struct rfile *f = ramfs_find(full);
     if (f == NULL) return -BURMALDA_ENOENT;
     uint8_t st[144];
     fill_stat(f, st);
@@ -1965,7 +2270,6 @@ static void burmalda_raise_signal(seL4_Word target, int signo,
 
 static long burmalda_handle_mprotect(void)    { return 0; }
 static long burmalda_handle_madvise(void)     { return 0; }
-static long burmalda_handle_fchdir(void)      { return 0; }
 static long burmalda_handle_dup3(void)        { return 0; }
 static long burmalda_handle_sigsuspend(void)  { return 0; }
 
@@ -2253,8 +2557,27 @@ static long burmalda_handle_readlink(seL4_Word badge)
     long size = burmalda_get_arg2();
     char path[128];
     if (!read_child_str(badge, pathp, path, sizeof(path))) return -BURMALDA_EFAULT;
+    struct bproc *bp = bproc_get(badge, false);
     const char *tgt = NULL;
-    if (strcmp(path, "/proc/self/exe") == 0) tgt = "/bin/busybox";
+    static char exe_buf[96], cwd_buf[128];
+    if (strcmp(path, "/proc/self/exe") == 0) {
+        if (bp != NULL && bp->exe[0] != '\0') {
+            memcpy(exe_buf, bp->exe, sizeof(exe_buf));
+        } else {
+            strcpy(exe_buf, "/bin/busybox");
+        }
+        tgt = exe_buf;
+    } else if (strcmp(path, "/proc/self/cwd") == 0 ||
+               strcmp(path, "/proc/self/fd") == 0) {
+        if (strcmp(path, "/proc/self/fd") == 0) {
+            tgt = "/";
+        } else if (bp != NULL && bp->cwd[0] != '\0') {
+            memcpy(cwd_buf, bp->cwd, sizeof(cwd_buf));
+            tgt = cwd_buf;
+        } else {
+            tgt = "/";
+        }
+    }
     if (tgt == NULL) return -BURMALDA_ENOENT;
     seL4_Word n = strlen(tgt);
     if ((seL4_Word)size < n) n = (seL4_Word)size;
@@ -2278,8 +2601,16 @@ static long burmalda_handle_copy_file_range(seL4_Word badge);
  * Dispatch
  * ----------------------------------------------------------------------- */
 
+static long burmalda_handle_chdir(seL4_Word badge);
+static long burmalda_handle_fchdir(seL4_Word badge);
+static long burmalda_handle_renameat(seL4_Word badge, bool at);
+static long burmalda_handle_mkdir(seL4_Word badge, bool at);
+static long burmalda_handle_rmdir(seL4_Word badge);
+static long burmalda_handle_chmod(seL4_Word badge, bool by_fd);
+
 static long burmalda_dispatch(seL4_Word badge, long nr)
 {
+
     switch (nr) {
     case BURMALDA_SYS_read:             return burmalda_handle_read(badge);
     case BURMALDA_SYS_write:            return burmalda_handle_write(badge);
@@ -2318,10 +2649,10 @@ static long burmalda_dispatch(seL4_Word badge, long nr)
     case BURMALDA_SYS_uname:            return burmalda_handle_uname(badge);
     case BURMALDA_SYS_fcntl:            return burmalda_handle_fcntl();
     case BURMALDA_SYS_getcwd:           return burmalda_handle_getcwd(badge);
-    case BURMALDA_SYS_chdir:            return burmalda_handle_fchdir();
+    case BURMALDA_SYS_chdir:            return burmalda_handle_chdir(badge);
     case BURMALDA_SYS_unlink:           return burmalda_handle_unlink(badge);
     case BURMALDA_SYS_chmod:            return burmalda_handle_noop();
-    case BURMALDA_SYS_fchmod:           return burmalda_handle_noop();
+    case BURMALDA_SYS_fchmod:           return burmalda_handle_chmod(badge, true);
     case BURMALDA_SYS_umask:            return burmalda_handle_umask();
     case BURMALDA_SYS_getrlimit:        return burmalda_handle_getrlimit(badge);
     case BURMALDA_SYS_getuid:           return burmalda_handle_getuid();
@@ -2357,7 +2688,12 @@ static long burmalda_dispatch(seL4_Word badge, long nr)
     case BURMALDA_SYS_sigaltstack:      return burmalda_handle_sigaltstack(badge);
     case BURMALDA_SYS_rt_sigsuspend:    return burmalda_handle_sigsuspend();
     case BURMALDA_SYS_madvise:          return burmalda_handle_madvise();
-    case BURMALDA_SYS_fchdir:           return burmalda_handle_fchdir();
+    case BURMALDA_SYS_fchdir:           return burmalda_handle_fchdir(badge);
+    case BURMALDA_SYS_rename:           return burmalda_handle_renameat(badge, false);
+    case BURMALDA_SYS_renameat2:        return burmalda_handle_renameat(badge, true);
+    case BURMALDA_SYS_mkdir:            return burmalda_handle_mkdir(badge, false);
+    case BURMALDA_SYS_mkdirat:          return burmalda_handle_mkdir(badge, true);
+    case BURMALDA_SYS_rmdir:            return burmalda_handle_rmdir(badge);
     case BURMALDA_SYS_readlink:         return burmalda_handle_readlink(badge);
     case BURMALDA_SYS_prlimit64:        return burmalda_handle_prlimit64(badge);
     case BURMALDA_SYS_flock:            return burmalda_handle_flock(badge);
@@ -2399,6 +2735,7 @@ void burmalda_run(seL4_CPtr ep, seL4_CPtr reply_obj)
         if (badge == 0) {
             seL4_IRQHandler_Ack(_serial_irq_notif);
             burmalda_complete_deferred_read();
+    burmalda_complete_deferred_poll();
             burmalda_complete_sleeps();
             info = seL4_ReplyRecv(ep, seL4_MessageInfo_new(0, 0, 0, 0),
                                   &badge, reply_obj);
@@ -2414,6 +2751,7 @@ void burmalda_run(seL4_CPtr ep, seL4_CPtr reply_obj)
 
         burmalda_timer_check(bproc_get(badge, false));
         burmalda_complete_deferred_read();
+        burmalda_complete_deferred_poll();
         burmalda_complete_sleeps();
         long nr = burmalda_get_syscall_nr();
         long retval = burmalda_dispatch(badge, nr);
@@ -2467,6 +2805,7 @@ void burmalda_run(seL4_CPtr ep, seL4_CPtr reply_obj)
 
         burmalda_timer_check(bproc_get(badge, false));
         burmalda_complete_deferred_read();
+        burmalda_complete_deferred_poll();
         burmalda_complete_sleeps();
         long nr = burmalda_get_syscall_nr();
         long retval = burmalda_dispatch(badge, nr);
