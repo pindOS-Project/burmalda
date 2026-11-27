@@ -30,6 +30,7 @@
 #include <string.h>
 
 #include <burmalda/protocol.h>
+#include <burmalda/vgaconsole.h>
 
 /* Embedded blobs (see ferrix-init/src/*_embed.S). */
 extern const uint8_t dinit_elf_start[];
@@ -51,6 +52,7 @@ extern const uint8_t rootfs_cpio_end[];
 
 static void burmalda_putbuf(const char *buf, seL4_Word len)
 {
+    burmalda_vga_emit(buf, len);
     for (seL4_Word i = 0; i < len; i++) {
         seL4_DebugPutChar(buf[i]);
     }

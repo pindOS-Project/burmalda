@@ -8,6 +8,7 @@ project(burmalda C)
 
 add_library(burmalda STATIC
     src/burmalda.c
+    src/vgaconsole.c
 )
 
 target_include_directories(burmalda PUBLIC
